@@ -93,24 +93,32 @@ def add_files(file_paths: List[str]) -> None:
 
 
 def remove_from_index(path: str) -> None:
-    """从暂存区移除文件"""
-    index = read_index()
     norm_path = os.path.normpath(path).replace("\\", "/")
-    if norm_path in index:
-        del index[norm_path]
+    index = read_index()
+    to_remove = [p for p in index if p == norm_path or p.startswith(norm_path + "/")]
+    for p in to_remove:
+        del index[p]
+    if to_remove:
         write_index(index)
 
 
+def remove_deleted_under(dir_path: str) -> List[str]:
+    norm_prefix = os.path.normpath(dir_path).replace("\\", "/")
+    if norm_prefix == ".":
+        norm_prefix = ""
+    index = read_index()
+    removed = []
+    for path in list(index.keys()):
+        under = (norm_prefix == "") or (path == norm_prefix) or path.startswith(norm_prefix + "/")
+        if under and not os.path.exists(path):
+            del index[path]
+            removed.append(path)
+    if removed:
+        write_index(index)
+    return removed
+
+
 def index_to_tree() -> str:
-    """
-    根据暂存区内容构建 tree 对象并返回其 SHA-1。
-    
-    这是 commit 操作的关键步骤：将暂存区中的扁平文件列表
-    转换为递归的 tree 对象结构。
-    
-    Returns:
-        根 tree 的 SHA-1
-    """
     index = read_index()
     
     tree_map: Dict[str, List[TreeEntry]] = {}
@@ -121,6 +129,11 @@ def index_to_tree() -> str:
         dir_path = "/".join(parts[:-1])
         file_name = parts[-1]
         
+        for i in range(1, len(parts)):
+            intermediate = "/".join(parts[:i])
+            if intermediate not in tree_map:
+                tree_map[intermediate] = []
+        
         if dir_path not in tree_map:
             tree_map[dir_path] = []
         
@@ -130,7 +143,11 @@ def index_to_tree() -> str:
             entry["sha1"]
         ))
     
-    all_dirs = sorted(tree_map.keys(), key=lambda x: x.count("/"), reverse=True)
+    all_dirs = sorted(
+        tree_map.keys(),
+        key=lambda x: x.count("/"),
+        reverse=True,
+    )
     
     for dir_path in all_dirs:
         if dir_path == "":
@@ -147,11 +164,13 @@ def index_to_tree() -> str:
         if parent_dir not in tree_map:
             tree_map[parent_dir] = []
         
-        tree_map[parent_dir].append(TreeEntry(
-            "040000",
-            dir_name,
-            tree_sha1
-        ))
+        already = any(e.name == dir_name and e.mode == "040000" for e in tree_map[parent_dir])
+        if not already:
+            tree_map[parent_dir].append(TreeEntry(
+                "040000",
+                dir_name,
+                tree_sha1
+            ))
     
     root_entries = tree_map.get("", [])
     root_tree_data = serialize_tree(root_entries)
@@ -317,9 +336,18 @@ def _scan_working_dir(dir_path: str, index: Dict[str, Dict], status: Dict) -> No
 
 
 def _get_head_commit_safe() -> Optional[str]:
-    """安全地获取 HEAD commit，失败返回 None"""
     try:
         from .objects import get_head_commit
         return get_head_commit()
     except Exception:
         return None
+
+
+def find_untracked_conflicts(target_tree_sha1: str) -> List[str]:
+    current_index = read_index()
+    target_index = tree_to_index(target_tree_sha1)
+    conflicts = []
+    for file_path in target_index:
+        if file_path not in current_index and os.path.exists(file_path):
+            conflicts.append(file_path)
+    return sorted(conflicts)

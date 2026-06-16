@@ -15,9 +15,11 @@ from .objects import (
 from .index import (
     add_file,
     checkout_tree,
+    find_untracked_conflicts,
     get_status,
     index_to_tree,
     read_index,
+    remove_deleted_under,
     tree_to_index,
     write_index,
 )
@@ -49,15 +51,6 @@ def cmd_init() -> int:
 
 
 def cmd_add(paths: list) -> int:
-    """
-    将文件添加到暂存区。
-    
-    Args:
-        paths: 文件路径列表
-    
-    Returns:
-        退出码
-    """
     if not os.path.exists(GIT_DIR):
         print("错误：不是 pytig 仓库（请先运行 pytig init）", file=sys.stderr)
         return 1
@@ -65,6 +58,9 @@ def cmd_add(paths: list) -> int:
     for path in paths:
         if os.path.isdir(path):
             _add_directory(path)
+            removed = remove_deleted_under(path)
+            for r in removed:
+                print(f"removed '{r}'")
         elif os.path.isfile(path):
             try:
                 add_file(path)
@@ -73,7 +69,14 @@ def cmd_add(paths: list) -> int:
                 print(f"错误：{e}", file=sys.stderr)
                 return 1
         else:
-            print(f"警告：路径不存在 - {path}", file=sys.stderr)
+            norm = os.path.normpath(path).replace("\\", "/")
+            index = read_index()
+            if norm in index:
+                from .index import remove_from_index
+                remove_from_index(path)
+                print(f"removed '{path}'")
+            else:
+                print(f"警告：路径不存在 - {path}", file=sys.stderr)
     
     return 0
 
@@ -238,42 +241,6 @@ def _format_date(author_line: str) -> str:
 
 
 def cmd_checkout(commit_ref: str, force: bool = False) -> int:
-    """
-    切换到指定的提交。
-    
-    **checkout 时处理未提交修改的策略选择**：
-    
-    我们选择的策略：**默认拒绝（安全第一），提供 --force 选项强制覆盖**。
-    
-    理由：
-    1. **数据安全优先**：未提交的修改是用户的工作成果，如果被静默覆盖
-       会造成不可逆的数据丢失。这是 Git 的设计哲学。
-    2. **用户明确意图**：只有用户明确指定 --force 时才覆盖，确保用户
-       知道自己在做什么。
-    3. **其他方案的问题**：
-       - 直接覆盖：太危险，容易造成意外数据丢失
-       - 尝试合并：实现复杂，且合并冲突对用户不友好；真正的合并
-         应该用 merge 命令显式进行
-       - 自动暂存（git stash）：增加了复杂性，且用户可能不理解
-         自动操作的含义
-    
-    所以我们采用 Git 默认的保守策略：有未提交修改时拒绝切换，
-    由用户决定如何处理（提交、丢弃还是强制切换）。
-    
-    工作流程：
-    1. 解析目标提交引用（可以是完整 SHA-1 或短 SHA-1）
-    2. 检查工作区是否有未提交的修改
-    3. 如果有修改且没有 --force，拒绝切换并给出提示
-    4. 如果允许切换，更新工作区和暂存区到目标提交的状态
-    5. 更新 HEAD 指向目标提交
-    
-    Args:
-        commit_ref: 提交引用（SHA-1 或短 SHA-1）
-        force: 是否强制切换（忽略未提交的修改）
-    
-    Returns:
-        退出码
-    """
     if not os.path.exists(GIT_DIR):
         print("错误：不是 pytig 仓库", file=sys.stderr)
         return 1
@@ -290,8 +257,10 @@ def cmd_checkout(commit_ref: str, force: bool = False) -> int:
         return 1
     
     if not force:
+        blocked = False
+        
         status = get_status()
-        has_changes = (
+        has_tracked_changes = (
             status["modified"] or
             status["deleted"] or
             status["staged_modified"] or
@@ -299,7 +268,8 @@ def cmd_checkout(commit_ref: str, force: bool = False) -> int:
             status["staged_deleted"]
         )
         
-        if has_changes:
+        if has_tracked_changes:
+            blocked = True
             print("错误：您有未提交的修改，无法切换分支/提交。", file=sys.stderr)
             print("请先提交您的修改，或者使用 --force 强制切换（会丢弃修改）。", file=sys.stderr)
             print()
@@ -319,6 +289,18 @@ def cmd_checkout(commit_ref: str, force: bool = False) -> int:
             if status["deleted"]:
                 for f in status["deleted"]:
                     print(f"  未暂存删除: {f}")
+        
+        untracked_conflicts = find_untracked_conflicts(commit["tree"])
+        if untracked_conflicts:
+            blocked = True
+            print("错误：以下未跟踪的文件会被目标提交覆盖，无法切换：", file=sys.stderr)
+            print(file=sys.stderr)
+            for f in untracked_conflicts:
+                print(f"  {f}", file=sys.stderr)
+            print(file=sys.stderr)
+            print("请在切换前移走或提交这些文件，或者使用 --force 强制覆盖。", file=sys.stderr)
+        
+        if blocked:
             return 1
     
     tree_sha1 = commit["tree"]
